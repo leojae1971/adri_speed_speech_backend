@@ -1,0 +1,11 @@
+fastapi
+uvicorn[standard]
+openai
+google-generativeai
+google-cloud-texttospeech
+azure-cognitiveservices-speech
+edge-tts
+groq
+python-multipart
+pydantic
+httpx

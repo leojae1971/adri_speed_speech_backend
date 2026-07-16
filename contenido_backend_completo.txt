@@ -1,0 +1,1137 @@
+--- ARCHIVO: ./config.py ---
+import os
+from dataclasses import dataclass, field
+from typing import Optional
+
+# ---------------------------------------------------------------------------
+# Límites verificados contra documentación oficial de cada proveedor
+# (julio 2026). Estos números cambian sin aviso — revisa los dashboards
+# de cada proveedor cada pocas semanas y ajusta SOLO aquí. Ningún otro
+# archivo debería tener un número de cuota escrito directamente.
+# ---------------------------------------------------------------------------
+
+
+@dataclass
+class ProviderLimits:
+    name: str
+    rpm: Optional[int] = None              # requests por minuto
+    rpd: Optional[int] = None              # requests por día
+    tpm: Optional[int] = None              # tokens por minuto
+    tpd: Optional[int] = None              # tokens por día
+    chars_per_month: Optional[int] = None  # solo TTS
+    context_window: Optional[int] = None   # tokens máximos de entrada (solo LLM)
+    reset: str = "daily"                   # "daily" | "monthly" | "none"
+    unlimited: bool = False
+    notes: str = ""
+
+
+# Los contadores son GLOBALES (por cuenta), no por usuario. Esto es
+# intencional: los free tiers de Groq/Cerebras/Azure limitan por CUENTA,
+# no por usuario final. Con 5 usuarios compartiendo la app, la cuota se
+# reparte entre todos — es exactamente como el proveedor lo ve.
+LLM_PROVIDERS_CONFIG = {
+    "groq": ProviderLimits(
+        name="groq", rpm=30, rpd=1000, tpm=6000, context_window=8192, reset="daily",
+        notes="Límite por modelo, no por cuenta completa. "
+              "Usamos llama-3.3-70b-versatile como modelo por defecto. "
+              "context_window=8192 es una ESTIMACIÓN CONSERVADORA, no "
+              "verificada oficialmente — confírmalo en console.groq.com.",
+    ),
+    "cerebras": ProviderLimits(
+        name="cerebras", rpm=5, tpd=1_000_000, tpm=30_000, context_window=8192, reset="daily",
+        notes="RPM bajado de 30 a 5 en 2026 — verifica en tu dashboard "
+              "antes de confiar en este número a largo plazo. "
+              "context_window=8192 es una ESTIMACIÓN CONSERVADORA sin "
+              "verificar oficialmente para gpt-oss-120b — el modelo puede "
+              "soportar bastante más; es un valor prudente para no "
+              "arriesgarnos a un 400 a mitad de conversación.",
+    ),
+    "gemini_flash": ProviderLimits(
+        name="gemini_flash", rpm=15, rpd=1500, tpm=1_000_000, context_window=1_000_000, reset="daily",
+        notes="El reset ocurre a medianoche hora del Pacífico (PT), "
+              "no a medianoche de Tanzania. Ojo con el cálculo del día. "
+              "Gemini Flash sí tiene 1M de contexto documentado oficialmente "
+              "— este número es más confiable que el de Groq/Cerebras.",
+    ),
+    "deepseek": ProviderLimits(
+        name="deepseek", unlimited=True, context_window=64_000, reset="none",
+        notes="NO es free tier permanente: regalo de 5M tokens, 30 días. "
+              "Tras eso, factura por token (muy barato). Lo tratamos como "
+              "colchón 'ilimitado mientras pagues centavos', último eslabón.",
+    ),
+}
+
+TTS_PROVIDERS_CONFIG = {
+    "azure": ProviderLimits(
+        name="azure", chars_per_month=500_000, reset="monthly",
+        notes="Tier F0, voces neural. Nunca expira.",
+    ),
+    "google_wavenet": ProviderLimits(
+        name="google_wavenet", chars_per_month=1_000_000, reset="monthly",
+        notes="OJO: el free tier de 4M caracteres de Google es para voces "
+              "Standard (robóticas). WaveNet/Neural2 (voz humana) es 1M. "
+              "No mezclar los dos números — ya nos equivocamos una vez "
+              "analizando otras propuestas de arquitectura por esto.",
+    ),
+    "edge_tts": ProviderLimits(
+        name="edge_tts", unlimited=True, reset="none",
+        notes="NO OFICIAL. Reverse-engineered del motor de voz de Edge. "
+              "Puede romperse sin aviso si Microsoft cambia el mecanismo "
+              "de autenticación interno. Úsalo como último respaldo, "
+              "nunca como proveedor único de producción.",
+    ),
+}
+
+STT_PROVIDERS_CONFIG = {
+    "groq_whisper": ProviderLimits(
+        name="groq_whisper", rpd=2000, reset="daily",
+    ),
+    "whisper_local": ProviderLimits(
+        name="whisper_local", unlimited=True, reset="none",
+        notes="faster-whisper corriendo en el mismo servidor. Requiere "
+              "CPU/GPU disponible — puedes usar tu PC con Ollama ya montado.",
+    ),
+}
+
+
+@dataclass
+class Settings:
+    groq_api_key: str = field(default_factory=lambda: os.getenv("GROQ_API_KEY", ""))
+    cerebras_api_key: str = field(default_factory=lambda: os.getenv("CEREBRAS_API_KEY", ""))
+    gemini_api_key: str = field(default_factory=lambda: os.getenv("GEMINI_API_KEY", ""))
+    deepseek_api_key: str = field(default_factory=lambda: os.getenv("DEEPSEEK_API_KEY", ""))
+    azure_speech_key: str = field(default_factory=lambda: os.getenv("AZURE_SPEECH_KEY", ""))
+    azure_speech_region: str = field(default_factory=lambda: os.getenv("AZURE_SPEECH_REGION", "eastus"))
+    google_tts_credentials_path: str = field(
+        default_factory=lambda: os.getenv("GOOGLE_APPLICATION_CREDENTIALS", "")
+    )
+    db_path: str = field(default_factory=lambda: os.getenv("DB_PATH", "adri_speech.db"))
+    audio_cache_dir: str = field(default_factory=lambda: os.getenv("AUDIO_CACHE_DIR", "./audio_cache"))
+
+
+settings = Settings()
+-e 
+
+--- ARCHIVO: ./viseme.py ---
+"""
+Generador de línea de tiempo de "visemas" (estados de boca) aproximado
+por duración de palabra — NO por análisis real del audio.
+
+Por qué esta simplificación: hacer análisis de amplitud real requiere
+decodificar MP3/PCM en el servidor (ffmpeg, pydub u otra dependencia
+pesada que además complica el despliegue en un free tier de hosting).
+Para un avatar estilizado (no fotorrealista), sincronizar la boca a la
+duración estimada de cada palabra es suficiente y es lo que hacen la
+mayoría de asistentes conversacionales 2D.
+
+Ruta de upgrade futura: si necesitas lip-sync fonético real, usa
+Rhubarb Lip Sync (binario open-source, MIT, corre en CPU en
+milisegundos). NUNCA uses SadTalker/Wav2Lip para conversación en
+tiempo real — son generadores de video por lote, tardan varios
+segundos por frase incluso en GPU.
+"""
+from dataclasses import dataclass, asdict
+
+# Ritmo de habla asumido. Ajusta esta constante cuando midas el
+# ritmo real de tus proveedores TTS (Azure/Google no siempre hablan
+# al mismo ritmo con el mismo texto).
+CHARS_PER_SECOND = 15
+
+
+@dataclass
+class VisemeFrame:
+    start_ms: int
+    end_ms: int
+    mouth: str  # "closed" | "half" | "open"
+
+
+def estimate_visemes(text: str) -> list[dict]:
+    """
+    Devuelve una lista de frames [{start_ms, end_ms, mouth}, ...] que
+    el cliente Flutter usa para animar la boca del avatar en sincronía
+    con la posición de reproducción del audio.
+    """
+    words = text.split()
+    if not words:
+        return []
+
+    frames: list[VisemeFrame] = []
+    t_ms = 0
+    for word in words:
+        duration_ms = max(80, int(len(word) / CHARS_PER_SECOND * 1000))
+        n_syl = max(1, len(word) // 3)  # aproximación cruda de sílabas
+        seg = duration_ms // n_syl
+        for i in range(n_syl):
+            mouth = "open" if i % 2 == 0 else "half"
+            frames.append(VisemeFrame(t_ms, t_ms + seg, mouth))
+            t_ms += seg
+        frames.append(VisemeFrame(t_ms, t_ms + 60, "closed"))  # pausa entre palabras
+        t_ms += 60
+
+    return [asdict(f) for f in frames]
+-e 
+
+--- ARCHIVO: ./providers/llm_providers.py ---
+"""
+Implementaciones concretas de LlmProvider.
+
+Groq, Cerebras y DeepSeek exponen APIs compatibles con el formato de
+OpenAI, así que reutilizamos el mismo cliente `openai` para las tres —
+solo cambia base_url y api_key. Gemini usa su propio SDK.
+"""
+from openai import AsyncOpenAI
+import google.generativeai as genai
+
+from config import settings
+from providers.base import LlmProvider
+
+
+class _OpenAICompatibleLlm(LlmProvider):
+    """Base reutilizable para Groq / Cerebras / DeepSeek."""
+
+    def __init__(self, name: str, base_url: str, api_key: str, model: str):
+        self.name = name
+        self.model = model
+        self.base_url = base_url
+        self.api_key = api_key
+        self._client = AsyncOpenAI(base_url=base_url, api_key=api_key)
+
+    async def chat(
+        self, messages: list[dict], json_mode: bool = False
+    ) -> tuple[str, int, int]:
+        """
+        Si json_mode=True, se pide al proveedor que garantice JSON
+        válido en la respuesta (soportado nativamente por Groq/
+        Cerebras/DeepSeek vía response_format). Es la alternativa
+        robusta a pedirle al LLM que use un delimitador de texto como
+        '|' para separar idioma destino y traducción — un LLM puede
+        "olvidar" el delimitador; con json_mode el proveedor fuerza
+        JSON válido a nivel de API, no de buena voluntad del modelo.
+
+        IMPORTANTE: si usas json_mode, tu prompt DEBE mencionar
+        explícitamente "json" y el esquema esperado (ej. incluir un
+        ejemplo de la forma {"target": "...", "translation": "..."}),
+        o el proveedor puede rechazar la petición.
+        """
+        kwargs = {}
+        if json_mode:
+            kwargs["response_format"] = {"type": "json_object"}
+
+        resp = await self._client.chat.completions.create(
+            model=self.model,
+            messages=messages,
+            max_tokens=300,  # limita el costo/tiempo de cada respuesta
+            **kwargs,
+        )
+        text = resp.choices[0].message.content
+        usage = resp.usage
+        return text, usage.prompt_tokens, usage.completion_tokens
+
+
+class GroqLlm(_OpenAICompatibleLlm):
+    def __init__(self):
+        super().__init__(
+            name="groq",
+            base_url="https://api.groq.com/openai/v1",
+            api_key=settings.groq_api_key,
+            model="llama-3.3-70b-versatile",
+        )
+
+
+class CerebrasLlm(_OpenAICompatibleLlm):
+    def __init__(self):
+        # OJO — verificado julio 2026: el catálogo público de Cerebras se
+        # redujo drásticamente (reporte independiente, abril 2026). Solo
+        # ~4 modelos siguen soportados oficialmente: llama3.1-8b,
+        # gpt-oss-120b, qwen-3-235b-a22b-instruct-2507, zai-glm-4.7.
+        # "llama-3.3-70b" (lo que había aquí antes) YA NO existe en el
+        # catálogo y además tenía el formato de nombre equivocado (los
+        # modelos de Cerebras no llevan guion entre "llama" y la versión:
+        # es "llama3.1-8b", no "llama-3.1-8b"). Antes de desplegar,
+        # confirma en https://inference-docs.cerebras.ai/models/overview
+        # que este modelo sigue vigente — este proveedor cambia su
+        # catálogo con más frecuencia que Groq o Gemini.
+        super().__init__(
+            name="cerebras",
+            base_url="https://api.cerebras.ai/v1",
+            api_key=settings.cerebras_api_key,
+            model="gpt-oss-120b",
+        )
+
+
+class DeepSeekLlm(_OpenAICompatibleLlm):
+    def __init__(self):
+        # OJO: revisa la fecha de deprecación de alias de modelo en el
+        # dashboard de DeepSeek antes de desplegar — cambian los nombres
+        # de modelo con más frecuencia que otros proveedores.
+        super().__init__(
+            name="deepseek",
+            base_url="https://api.deepseek.com",
+            api_key=settings.deepseek_api_key,
+            model="deepseek-chat",
+        )
+
+
+class GeminiFlashLlm(LlmProvider):
+    def __init__(self):
+        self.name = "gemini_flash"
+        genai.configure(api_key=settings.gemini_api_key)
+        self._model = genai.GenerativeModel("gemini-2.5-flash")
+
+    async def chat(
+        self, messages: list[dict], json_mode: bool = False
+    ) -> tuple[str, int, int]:
+        # google-generativeai no tiene cliente async estable en todas las
+        # versiones; para producción real, envuelve esto en un executor
+        # (loop.run_in_executor) para no bloquear el event loop de FastAPI.
+        prompt = "\n".join(f"{m['role']}: {m['content']}" for m in messages)
+        generation_config = {"response_mime_type": "application/json"} if json_mode else {}
+        resp = self._model.generate_content(prompt, generation_config=generation_config)
+        text = resp.text
+        input_tokens = getattr(resp.usage_metadata, "prompt_token_count", len(prompt) // 4)
+        output_tokens = getattr(resp.usage_metadata, "candidates_token_count", len(text) // 4)
+        return text, input_tokens, output_tokens
+-e 
+
+--- ARCHIVO: ./providers/__init__.py ---
+-e 
+
+--- ARCHIVO: ./providers/stt_providers.py ---
+"""
+Implementaciones concretas de SttProvider.
+"""
+import tempfile
+from groq import AsyncGroq
+
+from config import settings
+from providers.base import SttProvider
+
+
+class GroqWhisperStt(SttProvider):
+    name = "groq_whisper"
+
+    def __init__(self):
+        self._client = AsyncGroq(api_key=settings.groq_api_key)
+
+    async def transcribe(self, audio_bytes: bytes, lang: str) -> str:
+        with tempfile.NamedTemporaryFile(suffix=".wav") as f:
+            f.write(audio_bytes)
+            f.flush()
+            with open(f.name, "rb") as audio_file:
+                resp = await self._client.audio.transcriptions.create(
+                    file=audio_file,
+                    model="whisper-large-v3-turbo",
+                    language=lang,
+                )
+        return resp.text
+
+# No hay clase LocalWhisperStt aquí a propósito: el respaldo final de STT
+# vive en el cliente Flutter (paquete `speech_to_text`, ya integrado en
+# tu app), no en el backend. Ver router.py para la explicación completa.
+-e 
+
+--- ARCHIVO: ./providers/tts_providers.py ---
+"""
+Implementaciones concretas de TtsProvider: Azure, Google WaveNet, edge-tts.
+"""
+import io
+import azure.cognitiveservices.speech as speechsdk
+from google.cloud import texttospeech
+import edge_tts
+
+from config import settings
+from providers.base import TtsProvider
+
+
+class AzureTts(TtsProvider):
+    name = "azure"
+
+    async def synthesize(self, text: str, voice_id: str, lang: str) -> bytes:
+        speech_config = speechsdk.SpeechConfig(
+            subscription=settings.azure_speech_key,
+            region=settings.azure_speech_region,
+        )
+        speech_config.speech_synthesis_voice_name = voice_id  # ej: "en-US-AvaNeural"
+        speech_config.set_speech_synthesis_output_format(
+            speechsdk.SpeechSynthesisOutputFormat.Audio24Khz96KBitRateMonoMp3
+        )
+        synthesizer = speechsdk.SpeechSynthesizer(speech_config=speech_config, audio_config=None)
+        result = synthesizer.speak_text_async(text).get()
+        if result.reason != speechsdk.ResultReason.SynthesizingAudioCompleted:
+            raise RuntimeError(f"Azure TTS falló: {result.reason}")
+        return result.audio_data
+
+
+class GoogleWavenetTts(TtsProvider):
+    name = "google_wavenet"
+
+    def __init__(self):
+        # Inicialización perezosa a propósito: texttospeech.TextToSpeechClient()
+        # busca credenciales EN EL MOMENTO DE CONSTRUIRSE. Si esto se
+        # ejecuta al importar router.py (como pasaba antes) y no hay
+        # GOOGLE_APPLICATION_CREDENTIALS configurada, crashea el proceso
+        # completo al arrancar — ni siquiera Groq/Cerebras llegan a
+        # funcionar. Con el guard _tts_is_configured() en router.py,
+        # este cliente nunca se construye si faltan credenciales.
+        self._client = None
+
+    def _get_client(self):
+        if self._client is None:
+            self._client = texttospeech.TextToSpeechClient()
+        return self._client
+
+    async def synthesize(self, text: str, voice_id: str, lang: str) -> bytes:
+        # OJO: voice_id debe apuntar a una voz "Wavenet-*" o "Neural2-*".
+        # Si usas una voz "Standard-*" aquí, estarás consumiendo el tier
+        # de 4M (robótico) sin darte cuenta y rompiendo el requisito de
+        # calidad humana del proyecto.
+        synthesis_input = texttospeech.SynthesisInput(text=text)
+        voice = texttospeech.VoiceSelectionParams(language_code=lang, name=voice_id)
+        audio_config = texttospeech.AudioConfig(audio_encoding=texttospeech.AudioEncoding.MP3)
+        response = self._get_client().synthesize_speech(
+            input=synthesis_input, voice=voice, audio_config=audio_config
+        )
+        return response.audio_content
+
+
+class EdgeTts(TtsProvider):
+    """
+    No oficial — reverse-engineered del motor de voz de Microsoft Edge.
+    Último respaldo antes de caer al TTS on-device. Puede romperse sin
+    aviso si Microsoft cambia el mecanismo de autenticación interno.
+    """
+    name = "edge_tts"
+
+    async def synthesize(self, text: str, voice_id: str, lang: str) -> bytes:
+        communicate = edge_tts.Communicate(text, voice_id)  # ej: "en-US-AvaNeural"
+        buffer = io.BytesIO()
+        async for chunk in communicate.stream():
+            if chunk["type"] == "audio":
+                buffer.write(chunk["data"])
+        return buffer.getvalue()
+-e 
+
+--- ARCHIVO: ./providers/base.py ---
+"""
+Interfaces abstractas. Cada proveedor nuevo implementa una de estas
+clases y se registra en router.py — nunca se toca la lógica de
+orquestación para agregar un proveedor nuevo.
+"""
+from abc import ABC, abstractmethod
+
+
+class LlmProvider(ABC):
+    name: str
+
+    @abstractmethod
+    async def chat(self, messages: list[dict], json_mode: bool = False) -> tuple[str, int, int]:
+        """Devuelve (texto_respuesta, tokens_entrada, tokens_salida)."""
+        ...
+
+
+class TtsProvider(ABC):
+    name: str
+
+    @abstractmethod
+    async def synthesize(self, text: str, voice_id: str, lang: str) -> bytes:
+        """Devuelve audio en bytes (mp3)."""
+        ...
+
+
+class SttProvider(ABC):
+    name: str
+
+    @abstractmethod
+    async def transcribe(self, audio_bytes: bytes, lang: str) -> str:
+        ...
+-e 
+
+--- ARCHIVO: ./rate_limiter.py ---
+"""
+Limitador de tasa por minuto (RPM/TPM), en memoria.
+
+A diferencia de las cuotas diarias/mensuales (que si se pierden en un
+reinicio no importa demasiado), el RPM necesita ser rápido de consultar
+y no vale la pena persistirlo en SQLite: un reinicio del backend
+simplemente resetea la ventana, lo cual es aceptable en este volumen.
+"""
+import time
+import threading
+from collections import deque
+
+
+class SlidingWindowLimiter:
+    def __init__(self):
+        self._windows: dict[str, deque] = {}
+        self._lock = threading.Lock()
+
+    def allow(self, key: str, limit: int | None, window_seconds: int = 60) -> bool:
+        if limit is None:
+            return True
+        now = time.time()
+        with self._lock:
+            dq = self._windows.setdefault(key, deque())
+            while dq and dq[0] < now - window_seconds:
+                dq.popleft()
+            if len(dq) >= limit:
+                return False
+            dq.append(now)
+            return True
+
+
+rpm_limiter = SlidingWindowLimiter()
+-e 
+
+--- ARCHIVO: ./cache.py ---
+"""
+Caché de audio TTS por hash de (texto, voz, idioma).
+
+La optimización con mayor retorno del sistema: en una app de idiomas
+las frases de práctica se repiten muchísimo entre usuarios y sesiones.
+Cachear evita gastar cuota en sintetizar algo que ya existe.
+"""
+import hashlib
+from pathlib import Path
+
+from config import settings
+
+Path(settings.audio_cache_dir).mkdir(parents=True, exist_ok=True)
+
+
+def _cache_key(text: str, voice_id: str, lang: str) -> str:
+    raw = f"{text}:{voice_id}:{lang}".encode("utf-8")
+    return hashlib.sha256(raw).hexdigest()
+
+
+def get_cached_audio(text: str, voice_id: str, lang: str) -> bytes | None:
+    path = Path(settings.audio_cache_dir) / f"{_cache_key(text, voice_id, lang)}.mp3"
+    return path.read_bytes() if path.exists() else None
+
+
+def store_cached_audio(text: str, voice_id: str, lang: str, audio_bytes: bytes):
+    path = Path(settings.audio_cache_dir) / f"{_cache_key(text, voice_id, lang)}.mp3"
+    path.write_bytes(audio_bytes)
+-e 
+
+--- ARCHIVO: ./startup_checks.py ---
+"""
+Se ejecuta una vez al arrancar el backend (ver main.py, evento
+'startup'). Para cada proveedor LLM con endpoint OpenAI-compatible,
+consulta su catálogo real de modelos y compara contra el model_id que
+tenemos hardcodeado en providers/llm_providers.py.
+
+Si un modelo configurado ya no aparece en el catálogo real, lo
+registramos como advertencia en los logs — y opcionalmente marcamos
+el circuit breaker de ese proveedor como "permanently_broken" de una
+vez, en vez de esperar a que un usuario real dispare el primer 404.
+"""
+import logging
+
+from model_catalog import model_catalog
+from circuit_breaker import circuit_breaker, FailureType
+
+logger = logging.getLogger("adri.startup_checks")
+
+
+async def validate_llm_catalogs(llm_chain: list[tuple[str, object]]) -> dict[str, bool]:
+    """
+    Devuelve {provider_name: model_esta_vigente} para cada proveedor
+    verificable. Providers sin base_url/api_key/model expuestos (ej.
+    Gemini, que usa otro esquema de auth) se omiten silenciosamente —
+    ver la limitación documentada en model_catalog.py.
+    """
+    results: dict[str, bool] = {}
+
+    for key, provider in llm_chain:
+        base_url = getattr(provider, "base_url", None)
+        api_key = getattr(provider, "api_key", None)
+        model_id = getattr(provider, "model", None)
+        if not (base_url and api_key and model_id):
+            continue  # proveedor no verificable con este mecanismo (ej. Gemini)
+
+        available_models = await model_catalog.get_models(key, base_url, api_key)
+
+        if not available_models:
+            # No pudimos ni siquiera consultar el catálogo (red caída,
+            # key inválida, etc.) — no es lo mismo que "modelo no
+            # existe", así que no marcamos el breaker. Solo advertimos.
+            logger.warning(
+                "[%s] No se pudo verificar el catálogo de modelos (¿key inválida o "
+                "endpoint caído?). Asumiendo que '%s' sigue vigente sin confirmar.",
+                key, model_id,
+            )
+            continue
+
+        if model_id not in available_models:
+            logger.warning(
+                "[%s] El modelo configurado '%s' NO aparece en el catálogo actual "
+                "del proveedor. Modelos disponibles ahora: %s. "
+                "Actualiza providers/llm_providers.py antes de que un usuario "
+                "real reciba el error.",
+                key, model_id, available_models,
+            )
+            # Preemptivo: evita que el primer usuario real de hoy sea
+            # quien descubra el modelo muerto vía un 404 en su chat.
+            circuit_breaker.record_failure(key, FailureType.MODEL_NOT_FOUND)
+            results[key] = False
+        else:
+            logger.info("[%s] Modelo '%s' verificado correctamente.", key, model_id)
+            results[key] = True
+
+    return results
+-e 
+
+--- ARCHIVO: ./model_catalog.py ---
+"""
+Servicio de sincronización de catálogo de modelos — puerto a Python del
+patrón ya validado en ai_provider_resilience.dart (AI Council).
+
+Por qué existe: verificamos con evidencia real (reporte de GitHub,
+abril 2026) que Cerebras redujo su catálogo público de 16+ a ~4 modelos
+sin aviso previo, y que varios proyectos se rompieron por tener el
+model_id hardcodeado. Sin este servicio, ADRI se entera de que un
+modelo desapareció solo cuando falla una conversación real de un
+usuario (un 404 a mitad de sesión). Con este servicio, se entera al
+arrancar el backend — mucho antes de que le llegue tráfico real.
+
+Limitación conocida: solo cubre proveedores con endpoint OpenAI-
+compatible GET /models (Groq, Cerebras, DeepSeek). Gemini usa un
+esquema de auth distinto (?key= en la URL en vez de Bearer token) y
+no está cubierto aquí — queda como gap documentado, no resuelto.
+"""
+import time
+import httpx
+from dataclasses import dataclass, field
+
+
+@dataclass
+class CatalogEntry:
+    models: list[str] = field(default_factory=list)
+    fetched_at: float = 0.0
+    fetch_failed: bool = False
+
+
+class ModelCatalogService:
+    def __init__(self, ttl_seconds: int = 24 * 3600):
+        self.ttl_seconds = ttl_seconds
+        self._cache: dict[str, CatalogEntry] = {}
+
+    async def get_models(self, provider: str, base_url: str, api_key: str) -> list[str]:
+        entry = self._cache.get(provider)
+        if entry and not entry.fetch_failed and (time.time() - entry.fetched_at) < self.ttl_seconds:
+            return entry.models
+
+        try:
+            async with httpx.AsyncClient(timeout=8) as client:
+                resp = await client.get(
+                    f"{base_url}/models",
+                    headers={"Authorization": f"Bearer {api_key}"},
+                )
+            if resp.status_code == 200:
+                data = resp.json()
+                models = [m["id"] for m in data.get("data", [])]
+                self._cache[provider] = CatalogEntry(models=models, fetched_at=time.time())
+                return models
+            # Respuesta no-200 (ej. 401 con key inválida): no lo tratamos
+            # como catálogo vacío real, lo marcamos como "fetch fallido"
+            # para reintentar pronto en vez de asumir que no hay modelos.
+            self._cache[provider] = CatalogEntry(
+                models=entry.models if entry else [], fetched_at=time.time(), fetch_failed=True
+            )
+        except Exception:
+            self._cache[provider] = CatalogEntry(
+                models=entry.models if entry else [], fetched_at=time.time(), fetch_failed=True
+            )
+
+        return self._cache[provider].models
+
+    def invalidate(self, provider: str):
+        self._cache.pop(provider, None)
+
+
+model_catalog = ModelCatalogService()
+-e 
+
+--- ARCHIVO: ./circuit_breaker.py ---
+"""
+Circuit breaker persistente en SQLite: si un proveedor falla 3 veces
+seguidas, se "abre" el circuito por 60s y dejamos de intentarlo, en
+vez de martillarlo con requests que van a seguir fallando.
+
+Distingue tipos de fallo (adaptado de un diseño ya probado para el
+mismo problema en AI Council): un 429 es temporal y se resuelve con
+cooldown, pero un 404/"model not found" es PERMANENTE hasta que
+alguien actualice el model_id en config — reintentarlo en 60s no
+sirve de nada. Verificado como problema real: Cerebras redujo su
+catálogo de 16+ a ~4 modelos entre una fecha y otra sin aviso, y hay
+reportes de otros equipos rompiéndose por esto en producción.
+"""
+import sqlite3
+from datetime import datetime, timedelta, timezone
+from enum import Enum
+
+from config import settings
+
+FAILURE_THRESHOLD = 3
+COOLDOWN_SECONDS = 60
+
+
+class FailureType(str, Enum):
+    RATE_LIMITED = "rate_limited"     # 429 — temporal, cooldown normal
+    MODEL_NOT_FOUND = "model_not_found"  # 404 / modelo ya no existe — permanente
+    CONTEXT_TOO_LONG = "context_too_long"  # input excede la ventana del tier
+    SERVER_ERROR = "server_error"     # 5xx — temporal
+    AUTH_ERROR = "auth_error"         # 401/403 — clave inválida, no reintentar
+    TIMEOUT = "timeout"
+    UNKNOWN = "unknown"
+
+
+def classify_error(status_code: int | None, body: str = "") -> FailureType:
+    if status_code == 429:
+        return FailureType.RATE_LIMITED
+    if status_code in (401, 403):
+        return FailureType.AUTH_ERROR
+    if status_code == 404:
+        return FailureType.MODEL_NOT_FOUND
+    if status_code and status_code >= 500:
+        return FailureType.SERVER_ERROR
+    if status_code == 400 and body:
+        lower = body.lower()
+        if "model" in lower and ("not found" in lower or "does not exist" in lower or "invalid" in lower):
+            return FailureType.MODEL_NOT_FOUND
+        if "context" in lower or ("token" in lower and "exceed" in lower) or "too long" in lower:
+            return FailureType.CONTEXT_TOO_LONG
+    return FailureType.UNKNOWN
+
+
+def _init_db():
+    with sqlite3.connect(settings.db_path) as conn:
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS circuit_state (
+                provider TEXT PRIMARY KEY,
+                consecutive_failures INTEGER NOT NULL DEFAULT 0,
+                open_until TEXT,
+                permanently_broken INTEGER NOT NULL DEFAULT 0
+            )
+        """)
+
+
+_init_db()
+
+
+class CircuitBreaker:
+    def is_open(self, provider: str) -> bool:
+        with sqlite3.connect(settings.db_path) as conn:
+            row = conn.execute(
+                "SELECT open_until, permanently_broken FROM circuit_state WHERE provider=?",
+                (provider,),
+            ).fetchone()
+        if row is None:
+            return False
+        open_until, permanently_broken = row
+        if permanently_broken:
+            # Modelo deprecado/auth inválida: no reintentar nunca hasta
+            # que alguien corrija config.py manualmente y reinicie.
+            return True
+        if open_until is None:
+            return False
+        return datetime.now(timezone.utc) < datetime.fromisoformat(open_until)
+
+    def record_failure(self, provider: str, failure_type: FailureType = FailureType.UNKNOWN):
+        with sqlite3.connect(settings.db_path) as conn:
+            if failure_type in (FailureType.MODEL_NOT_FOUND, FailureType.AUTH_ERROR):
+                # Permanente: no tiene sentido un cooldown de 60s para
+                # un modelo que ya no existe o una clave inválida.
+                conn.execute("""
+                    INSERT INTO circuit_state (provider, consecutive_failures, open_until, permanently_broken)
+                    VALUES (?, 0, NULL, 1)
+                    ON CONFLICT(provider) DO UPDATE SET permanently_broken = 1
+                """, (provider,))
+                return
+
+            if failure_type == FailureType.CONTEXT_TOO_LONG:
+                # Deliberadamente NO abrimos el circuito ni sumamos al
+                # contador de fallos: esto es un problema del TAMAÑO del
+                # turno actual (historial de conversación muy largo),
+                # no de la salud del proveedor. El próximo turno, con
+                # menos contexto acumulado, puede funcionar perfecto en
+                # el mismo proveedor. route_chat ya debería haber
+                # evitado esta llamada con el chequeo de context_window
+                # en config.py — si llegaste aquí, ese chequeo falló o
+                # el límite real es más bajo de lo que tenemos anotado.
+                return
+
+            row = conn.execute(
+                "SELECT consecutive_failures FROM circuit_state WHERE provider=?", (provider,)
+            ).fetchone()
+            failures = (row[0] if row else 0) + 1
+            open_until = None
+            if failures >= FAILURE_THRESHOLD:
+                open_until = (datetime.now(timezone.utc) + timedelta(seconds=COOLDOWN_SECONDS)).isoformat()
+                failures = 0
+            conn.execute("""
+                INSERT INTO circuit_state (provider, consecutive_failures, open_until, permanently_broken)
+                VALUES (?, ?, ?, 0)
+                ON CONFLICT(provider) DO UPDATE SET
+                    consecutive_failures = excluded.consecutive_failures,
+                    open_until = excluded.open_until
+            """, (provider, failures, open_until))
+
+    def record_success(self, provider: str):
+        with sqlite3.connect(settings.db_path) as conn:
+            conn.execute("""
+                INSERT INTO circuit_state (provider, consecutive_failures, open_until, permanently_broken)
+                VALUES (?, 0, NULL, 0)
+                ON CONFLICT(provider) DO UPDATE SET
+                    consecutive_failures = 0, open_until = NULL, permanently_broken = 0
+            """, (provider,))
+
+
+circuit_breaker = CircuitBreaker()
+-e 
+
+--- ARCHIVO: ./quota_manager.py ---
+"""
+Gestión de cuotas persistente en SQLite (diaria/mensual).
+"""
+import sqlite3
+import threading
+from datetime import datetime, timezone
+
+from config import settings
+
+_lock = threading.Lock()
+
+
+def _init_db():
+    with sqlite3.connect(settings.db_path) as conn:
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS usage (
+                provider TEXT NOT NULL,
+                period_key TEXT NOT NULL,
+                requests INTEGER NOT NULL DEFAULT 0,
+                tokens INTEGER NOT NULL DEFAULT 0,
+                chars INTEGER NOT NULL DEFAULT 0,
+                PRIMARY KEY (provider, period_key)
+            )
+        """)
+
+
+_init_db()
+
+
+def _period_key(reset: str) -> str:
+    now = datetime.now(timezone.utc)
+    if reset == "daily":
+        return now.strftime("%Y-%m-%d")
+    if reset == "monthly":
+        return now.strftime("%Y-%m")
+    return "none"
+
+
+class QuotaManager:
+    def get_usage(self, provider: str, reset: str) -> dict:
+        key = _period_key(reset)
+        with sqlite3.connect(settings.db_path) as conn:
+            row = conn.execute(
+                "SELECT requests, tokens, chars FROM usage WHERE provider=? AND period_key=?",
+                (provider, key),
+            ).fetchone()
+        if row is None:
+            return {"requests": 0, "tokens": 0, "chars": 0}
+        return {"requests": row[0], "tokens": row[1], "chars": row[2]}
+
+    def record(self, provider: str, reset: str, requests=0, tokens=0, chars=0):
+        key = _period_key(reset)
+        with _lock, sqlite3.connect(settings.db_path) as conn:
+            conn.execute("""
+                INSERT INTO usage (provider, period_key, requests, tokens, chars)
+                VALUES (?, ?, ?, ?, ?)
+                ON CONFLICT(provider, period_key) DO UPDATE SET
+                    requests = requests + excluded.requests,
+                    tokens = tokens + excluded.tokens,
+                    chars = chars + excluded.chars
+            """, (provider, key, requests, tokens, chars))
+
+    def has_quota(self, provider: str, limits, needed_requests=0, needed_tokens=0, needed_chars=0) -> bool:
+        if limits.unlimited:
+            return True
+        usage = self.get_usage(provider, limits.reset)
+        if limits.rpd is not None and usage["requests"] + needed_requests > limits.rpd:
+            return False
+        if limits.tpd is not None and usage["tokens"] + needed_tokens > limits.tpd:
+            return False
+        if limits.chars_per_month is not None and usage["chars"] + needed_chars > limits.chars_per_month:
+            return False
+        return True
+
+
+quota_manager = QuotaManager()
+-e 
+
+--- ARCHIVO: ./router.py ---
+"""
+El corazón del switcher: ProviderChain orquesta cuota + circuit breaker +
+caché para LLM, TTS y STT. main.py no necesita saber nada de los
+proveedores individuales — solo llama a route_chat/route_tts/route_stt.
+"""
+from config import LLM_PROVIDERS_CONFIG, TTS_PROVIDERS_CONFIG, STT_PROVIDERS_CONFIG, settings
+from quota_manager import quota_manager
+from circuit_breaker import circuit_breaker, classify_error
+from rate_limiter import rpm_limiter
+from cache import get_cached_audio, store_cached_audio
+
+from providers.llm_providers import GroqLlm, CerebrasLlm, GeminiFlashLlm, DeepSeekLlm
+from providers.tts_providers import AzureTts, GoogleWavenetTts, EdgeTts
+from providers.stt_providers import GroqWhisperStt
+
+
+LLM_CHAIN = [
+    ("groq", GroqLlm()),
+    ("cerebras", CerebrasLlm()),
+    ("gemini_flash", GeminiFlashLlm()),
+    ("deepseek", DeepSeekLlm()),
+]
+
+TTS_CHAIN = [
+    ("azure", AzureTts()),
+    ("google_wavenet", GoogleWavenetTts()),
+    ("edge_tts", EdgeTts()),
+]
+
+# Providers que requieren credenciales externas: si faltan, se saltan
+# ANTES de intentarlos, en vez de fallar cada vez y desperdiciar
+# latencia. Sin esto, un Azure sin key configurada se reintenta en
+# cada turno de conversación porque AzureTts lanza un RuntimeError
+# genérico que el clasificador de fallos no puede distinguir como
+# "mal configurado permanentemente" — este chequeo explícito es más
+# simple y confiable que intentar parsear el mensaje de error del SDK.
+def _tts_is_configured(provider_key: str) -> bool:
+    if provider_key == "azure":
+        return bool(settings.azure_speech_key)
+    if provider_key == "google_wavenet":
+        return bool(settings.google_tts_credentials_path)
+    return True  # edge_tts no requiere credenciales
+
+STT_CHAIN = [
+    ("groq_whisper", GroqWhisperStt()),
+    # Sin whisper_local: decidimos NO depender de self-hosting (Ollama,
+    # faster-whisper, Kokoro) porque exige mantener un servidor/GPU
+    # encendido 24/7. Cuando esta cadena se agota, el backend devuelve
+    # 503 y el respaldo final ocurre EN EL CLIENTE con el paquete
+    # `speech_to_text` (STT nativo del dispositivo), que ya está resuelto
+    # en tu app desde el arreglo de Gradle al inicio de esta conversación.
+]
+
+
+class AllProvidersExhausted(Exception):
+    pass
+
+
+def _estimate_tokens(messages: list[dict]) -> int:
+    """
+    Estimación cruda (chars/4) — no es un tokenizer real, pero sirve
+    para decidir "¿vale la pena intentar este proveedor?" sin gastar
+    una llamada de red. Sobreestima ligeramente en la mayoría de
+    idiomas latinos, lo cual es el lado seguro del error aquí.
+    """
+    total_chars = sum(len(m.get("content", "")) for m in messages)
+    return total_chars // 4
+
+
+async def route_chat(messages: list[dict], json_mode: bool = False) -> dict:
+    estimated_tokens = _estimate_tokens(messages)
+    last_error = None
+    for key, provider in LLM_CHAIN:
+        limits = LLM_PROVIDERS_CONFIG[key]
+
+        if circuit_breaker.is_open(key):
+            continue
+        if not rpm_limiter.allow(key, limits.rpm):
+            continue
+        if not quota_manager.has_quota(key, limits, needed_requests=1):
+            continue
+        if limits.context_window and estimated_tokens > limits.context_window:
+            # Nos ahorramos la llamada: sabemos que este proveedor va a
+            # devolver un error de contexto excedido con este historial.
+            # Salta directo al siguiente (ej. Gemini Flash, con 1M de
+            # ventana) sin gastar cuota ni tiempo en un 400 seguro.
+            continue
+
+        try:
+            text, in_tok, out_tok = await provider.chat(messages, json_mode=json_mode)
+            quota_manager.record(key, limits.reset, requests=1, tokens=in_tok + out_tok)
+            circuit_breaker.record_success(key)
+            return {"text": text, "provider_used": key, "tokens": in_tok + out_tok}
+        except Exception as e:
+            last_error = e
+            # openai.APIStatusError (y subclases) exponen status_code;
+            # si no está disponible, se clasifica como UNKNOWN (cooldown
+            # normal, no permanente) — más seguro que asumir lo peor.
+            status_code = getattr(e, "status_code", None)
+            failure_type = classify_error(status_code, str(e))
+            circuit_breaker.record_failure(key, failure_type)
+            continue
+
+    raise AllProvidersExhausted(f"Todos los LLM fallaron o están agotados. Último error: {last_error}")
+
+
+async def route_tts(text: str, voice_id: str, lang: str) -> dict:
+    cached = get_cached_audio(text, voice_id, lang)
+    if cached is not None:
+        return {"audio": cached, "provider_used": "cache"}
+
+    last_error = None
+    for key, provider in TTS_CHAIN:
+        limits = TTS_PROVIDERS_CONFIG[key]
+
+        if not _tts_is_configured(key):
+            continue  # sin credenciales — ni lo intentes, ahorra latencia
+        if circuit_breaker.is_open(key):
+            continue
+        if not quota_manager.has_quota(key, limits, needed_chars=len(text)):
+            continue
+
+        try:
+            audio = await provider.synthesize(text, voice_id, lang)
+            quota_manager.record(key, limits.reset, chars=len(text))
+            circuit_breaker.record_success(key)
+            store_cached_audio(text, voice_id, lang, audio)
+            return {"audio": audio, "provider_used": key}
+        except Exception as e:
+            last_error = e
+            circuit_breaker.record_failure(key)
+            continue
+
+    raise AllProvidersExhausted(f"Todos los TTS fallaron o están agotados. Último error: {last_error}")
+
+
+async def route_stt(audio_bytes: bytes, lang: str) -> dict:
+    last_error = None
+    for key, provider in STT_CHAIN:
+        limits = STT_PROVIDERS_CONFIG[key]
+
+        if circuit_breaker.is_open(key):
+            continue
+        if not quota_manager.has_quota(key, limits, needed_requests=1):
+            continue
+
+        try:
+            text = await provider.transcribe(audio_bytes, lang)
+            quota_manager.record(key, limits.reset, requests=1)
+            circuit_breaker.record_success(key)
+            return {"text": text, "provider_used": key}
+        except Exception as e:
+            last_error = e
+            circuit_breaker.record_failure(key)
+            continue
+
+    raise AllProvidersExhausted(f"Todos los STT fallaron o están agotados. Último error: {last_error}")
+-e 
+
+--- ARCHIVO: ./main.py ---
+"""
+Punto de entrada. Flutter SOLO conoce estos tres endpoints — nunca
+Groq, Azure, Gemini, etc. directamente.
+"""
+import base64
+import json
+import os
+
+# Render (y la mayoría de PaaS) no permiten "subir un archivo" como
+# variable de entorno. Si GOOGLE_CREDENTIALS_JSON está definida (el
+# contenido completo del JSON de la cuenta de servicio, pegado tal
+# cual), lo reconstruimos como archivo en disco al arrancar, y
+# apuntamos GOOGLE_APPLICATION_CREDENTIALS ahí. Si ya tienes el
+# archivo localmente (desarrollo en tu PC), esto no hace nada.
+_google_creds_json = os.getenv("GOOGLE_CREDENTIALS_JSON")
+if _google_creds_json:
+    _creds_path = "/tmp/google-credentials.json"
+    with open(_creds_path, "w") as f:
+        f.write(_google_creds_json)
+    os.environ["GOOGLE_APPLICATION_CREDENTIALS"] = _creds_path
+
+from fastapi import FastAPI, HTTPException, UploadFile, File, Form
+from pydantic import BaseModel
+
+from router import route_chat, route_tts, route_stt, AllProvidersExhausted, LLM_CHAIN
+from viseme import estimate_visemes
+from startup_checks import validate_llm_catalogs
+
+app = FastAPI(title="ADRI SPEED SPEECH Backend")
+
+
+@app.on_event("startup")
+async def _startup_model_validation():
+    """
+    Corre una vez por deploy. Revisa logs de Render/Koyeb tras cada
+    despliegue — si ves un WARNING de modelo no encontrado aquí, es
+    mucho más barato corregirlo ahora que esperar a que un usuario
+    real tope con una conversación rota.
+    """
+    await validate_llm_catalogs(LLM_CHAIN)
+
+
+class ChatRequest(BaseModel):
+    messages: list[dict]  # [{"role": "user", "content": "..."}]
+    json_mode: bool = False
+
+
+class TtsRequest(BaseModel):
+    text: str
+    voice_id: str = "en-US-AvaNeural"
+    lang: str = "en-US"
+
+
+@app.post("/chat")
+async def chat(req: ChatRequest):
+    try:
+        result = await route_chat(req.messages, json_mode=req.json_mode)
+        if req.json_mode:
+            # Red de seguridad: aunque json_mode fuerza JSON a nivel de
+            # API en la mayoría de proveedores, un proveedor de la
+            # cadena podría no soportarlo y devolver texto plano de
+            # todas formas. Si el parseo falla, no rompemos la
+            # respuesta — devolvemos el texto crudo bajo "text" y
+            # dejamos que el cliente decida cómo degradar.
+            try:
+                result["parsed"] = json.loads(result["text"])
+            except (json.JSONDecodeError, TypeError):
+                result["parsed"] = None
+        return result
+    except AllProvidersExhausted as e:
+        raise HTTPException(status_code=503, detail=str(e))
+
+
+@app.post("/tts")
+async def tts(req: TtsRequest):
+    """
+    Devuelve JSON (no audio binario crudo): el audio va en base64 junto
+    a la línea de tiempo de visemas, para que Flutter pueda animar el
+    avatar sin hacer una segunda llamada.
+    """
+    try:
+        result = await route_tts(req.text, req.voice_id, req.lang)
+        return {
+            "audio_base64": base64.b64encode(result["audio"]).decode("ascii"),
+            "provider_used": result["provider_used"],
+            "visemes": estimate_visemes(req.text),
+        }
+    except AllProvidersExhausted as e:
+        raise HTTPException(status_code=503, detail=str(e))
+
+
+@app.post("/transcribe")
+async def transcribe(file: UploadFile = File(...), lang: str = Form("en")):
+    try:
+        audio_bytes = await file.read()
+        return await route_stt(audio_bytes, lang)
+    except AllProvidersExhausted as e:
+        raise HTTPException(status_code=503, detail=str(e))
+
+
+@app.get("/health")
+async def health():
+    return {"status": "ok"}
+-e 
+
