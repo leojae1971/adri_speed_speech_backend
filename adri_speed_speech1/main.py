@@ -106,12 +106,18 @@ async def chat(req: ChatRequest):
         result = await route_chat(req.messages, json_mode=req.json_mode)
         full_text = result.get("text", "")
         
+        # Extraer respuesta del avatar y traducción
+        avatar_response = ""
+        user_translation = ""
         if "===TRANS===" in full_text:
-            avatar_response = full_text.split("===TRANS===")[0].strip()
+            parts = full_text.split("===TRANS===")
+            avatar_response = parts[0].strip()
+            user_translation = parts[1].strip() if len(parts) > 1 else ""
         else:
             avatar_response = full_text
         
         clean_avatar_response = clean_tags(avatar_response)
+        clean_translation = clean_tags(user_translation)
 
         audio_base64 = None
         visemes = []
@@ -126,6 +132,7 @@ async def chat(req: ChatRequest):
 
         response = {
             "text": full_text,
+            "userTranslation": clean_translation,  # <-- NUEVO CAMPO
             "provider_used": result.get("provider_used"),
             "tokens": result.get("tokens"),
         }
@@ -142,7 +149,6 @@ async def chat(req: ChatRequest):
         return response
     except AllProvidersExhausted as e:
         raise HTTPException(status_code=503, detail=str(e))
-
 @app.post("/tts")
 async def tts(req: TtsRequest):
     if not is_valid_text(req.text):
