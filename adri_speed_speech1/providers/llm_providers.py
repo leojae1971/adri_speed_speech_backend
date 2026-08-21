@@ -72,7 +72,7 @@ class GroqLlm(_OpenAICompatibleLlm):
             name="groq",
             base_url="https://api.groq.com/openai/v1",
             api_key=settings.groq_api_key,
-            model="llama-3.3-70b-versatile",
+            model="groq/compound",
         )
 
 
@@ -137,3 +137,4 @@ class GeminiFlashLlm(LlmProvider):
         input_tokens = getattr(resp.usage_metadata, "prompt_token_count", len(prompt) // 4)
         output_tokens = getattr(resp.usage_metadata, "candidates_token_count", len(text) // 4)
         return text, input_tokens, output_tokens
+#Cambio a modelo gratuito groq/compound
